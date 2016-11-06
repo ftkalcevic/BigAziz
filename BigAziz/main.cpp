@@ -10,6 +10,7 @@
 #include <string.h>
 #include <util/delay.h>
 
+#define LED_BRIGHTNESS	255
 #define LIGHT_COUNT		(10*4+8*4)
 #define DEBOUNCE_TIME	20	// ms
 
@@ -27,7 +28,8 @@ uint8_t submode = 0;
 
 uint8_t intensity[LIGHT_COUNT];
 //uint8_t globalBrightness = 0x1F | 0xE0;
-uint8_t globalBrightness = 0x1 | 0xE0;
+uint8_t globalBrightness = 0;
+#define MAX_GLOBAL_BRIGHTNESS	31
 
 #define FromAB(a,b)		(((a)<<3) | ((b)<<2))
 #define ToAB(a,b)		(((a)<<1) | (b))
@@ -83,7 +85,7 @@ ISR(PCINT2_vect)
 	// Encoder input
 	nLastEncoder <<= 2;
 	nLastEncoder |= ((PIND >> 6) & 3);
-	nEncoder += EncoderMap[nLastEncoder & 0XF];
+	nEncoder -= EncoderMap[nLastEncoder & 0XF];
 }
 
 ISR(TIMER0_COMPA_vect)
@@ -155,7 +157,7 @@ static void Send()
 	// Data
 	for ( uint8_t i = 0; i < LIGHT_COUNT; i++ )
 	{
-		SPDR = globalBrightness;
+		SPDR = globalBrightness | 0xE0;
 		while ( !(SPSR & _BV(SPIF)) );
 		uint8_t n = intensity[i];
 		SPDR = n;
@@ -223,17 +225,135 @@ void SetSubmode( EMode mode, uint8_t subMode )
 	}
 }
 
+template<int n>
+class MultiSegDisplay
+{
+private:
+	uint8_t seg_start;
+	uint8_t seg_length;
+public:
+	MultiSegDisplay()
+	{
+		seg_start = 0;
+		seg_length = LIGHT_COUNT/(n+1);
+	}
+
+	void CalcSeg()
+	{
+		memset( intensity, 0, sizeof(intensity) );
+		for ( uint8_t i= 0; i < seg_length; i++ )
+			for ( uint8_t j=0; j < n; j++ )
+			{
+				intensity[(seg_start+i+j*LIGHT_COUNT/n)%LIGHT_COUNT] = LED_BRIGHTNESS;
+			}
+	}
+
+	bool ProcessSeg( int8_t delta, int8_t deltaEncoder )
+	{
+		if ( submode == 1 )
+		{
+			seg_start = (seg_start + LIGHT_COUNT + deltaEncoder) % LIGHT_COUNT;
+		}
+		else if ( submode == 2 )
+		{
+			seg_length += delta;
+			if ( seg_length < 1 )
+				seg_length = 1;
+			else if ( seg_length > LIGHT_COUNT/n )
+				seg_length = LIGHT_COUNT/n;
+		}
+		CalcSeg();
+		Send();
+
+		return true;
+	}
+};
+
+
+MultiSegDisplay<1> OneSeg;
+MultiSegDisplay<2> TwoSeg;
+MultiSegDisplay<3> ThreeSeg;
+MultiSegDisplay<4> FourSeg;
+
 static void SetMode( EMode newMode )
 {
 	mode = newMode;
 	submode = 0;
 	switch ( mode )
 	{
-		case EMode::AllOn:		SetRGB(1,1,1); break;
-		case EMode::OneSeg:		SetRGB(1,0,0); break;
-		case EMode::TwoSeg:		SetRGB(0,1,0); break;
-		case EMode::ThreeSeg:	SetRGB(0,0,1); break;
-		case EMode::FourSeg:	SetRGB(1,1,0); break;
+		case EMode::AllOn:		
+			SetRGB(1,1,1); 
+			memset( intensity, LED_BRIGHTNESS, sizeof(intensity) );
+			break;
+		case EMode::OneSeg:		
+			SetRGB(1,0,0); 
+			OneSeg.CalcSeg();
+			break;
+		case EMode::TwoSeg:		
+			SetRGB(0,1,0); 
+			TwoSeg.CalcSeg();
+			break;
+		case EMode::ThreeSeg:	
+			SetRGB(0,0,1); 
+			ThreeSeg.CalcSeg();
+			break;
+		case EMode::FourSeg:	
+			SetRGB(1,1,0); 
+			FourSeg.CalcSeg();
+			break;
+	}
+	Send();
+}
+
+static int8_t deltaEncoder = 0;
+static void ProcessEncoder( int8_t delta )
+{
+	deltaEncoder += delta;
+
+	int8_t nDelta = 0;
+	bool bChange = false;
+	while ( deltaEncoder >= 4 )
+	{
+		nDelta--;
+		deltaEncoder -= 4;
+	}
+	while ( deltaEncoder <= -4 )
+	{
+		nDelta++;
+		deltaEncoder += 4;
+	}
+
+	if ( submode == 0 )
+	{
+		if ( nDelta < 0 && globalBrightness > 0 )
+		{
+			globalBrightness--;
+			bChange = true;
+		}
+		else if ( nDelta > 0 && globalBrightness < MAX_GLOBAL_BRIGHTNESS )
+		{
+			globalBrightness++;
+			bChange = true;
+		}
+
+		if ( bChange )
+			Send();
+	}
+	else if ( mode == EMode::OneSeg )
+	{
+		OneSeg.ProcessSeg(nDelta, delta);
+	}
+	else if ( mode == EMode::TwoSeg )
+	{
+		TwoSeg.ProcessSeg(nDelta, delta);
+	}
+	else if ( mode == EMode::ThreeSeg )
+	{
+		ThreeSeg.ProcessSeg(nDelta, delta);
+	}
+	else if ( mode == EMode::FourSeg )
+	{
+		FourSeg.ProcessSeg(nDelta, delta);
 	}
 }
 
@@ -249,40 +369,31 @@ int main(void)
 
 	SetMode( EMode::AllOn );
 
+	bool bSoftStarting = true;
+	uint16_t nSoftStartTime = ms;
 	uint16_t nDownTimeStart = 0;
 	bool bOn = false;
     while (1) 
     {
-		//for (;;)
-		//{
-			//globalBrightness = 0x1 | 0xE0;
-			//static uint8_t n = 0;
-			//n++;
-			//memset( intensity, n & 1 ? 16 : 0, sizeof(intensity) );
-			//Send();
-			//_delay_ms(500);
-		//}
-		//for (;;)
-		//{
-			//globalBrightness = 0x1 | 0xE0;
-			//static uint8_t n = 0;
-			//n++;
-			//memset( intensity, 0, sizeof(intensity) );
-			////for ( uint8_t i = 0; i < LIGHT_COUNT-1; i+=2 )
-			////	intensity[i + (n&1) ] = 15;
-			//intensity[n % LIGHT_COUNT] = 15;
-			//Send();
-			//_delay_ms(100);
-		//}
+
+		if ( bSoftStarting )
+		{
+			uint16_t Time = ms - nSoftStartTime;
+			if ( Time > 30 )
+			{
+				globalBrightness++;
+				Send();
+				if ( globalBrightness >= MAX_GLOBAL_BRIGHTNESS/2 )
+					bSoftStarting = false;
+				else
+					nSoftStartTime = ms;
+			}
+		}
+
 		if ( nLastEncoderValue != nEncoder )
 		{
+			ProcessEncoder( nEncoder - nLastEncoderValue );
 			nLastEncoderValue = nEncoder;
-			uint8_t n = 0;
-			if ( nLastEncoderValue > 0  && nLastEncoderValue <= 255 )
-			{
-				memset( intensity, nLastEncoderValue, sizeof(intensity) );
-				Send();
-			}
 		}
 
 		if ( bKeyDown )
@@ -312,6 +423,7 @@ int main(void)
 					else
 					{
 						SetSubmode( mode, 0 );
+						SetMode(mode);
 					}
 				}
 				nDownTimeStart = 0;
